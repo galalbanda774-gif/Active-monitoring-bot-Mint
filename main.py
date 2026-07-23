@@ -1,12 +1,6 @@
 """
-نظام مراقبة نشاط البيع لمقتنياتك على OpenSea (Robinhood Chain).
-مستقل تمامًا عن بوت الشراء — بوت تيليجرام خاص، ومحفظة/محافظ منفصلة للمراقبة فقط.
-
-الفكرة:
-  1. كل 15 دقيقة: يجيب كل NFTs المملوكة لمحافظك عبر Alchemy NFT API
-  2. يراقب أحداث البيع (item_sold) على تلك المجموعات فقط عبر OpenSea Stream
-  3. كل 30 دقيقة: يرسل رسالة واحدة مجمّعة لكل المجموعات "النشطة" (فيها بيع خلال آخر 30 دقيقة)
-  4. مجموعة تخرج من القائمة النشطة تلقائيًا لو ما شافت بيع لمدة 30 دقيقة
+نظام مراقبة نشاط البيع لمقتنياتك على OpenSea — يدعم Robinhood Chain + Ethereum Mainnet.
+مستقل تمامًا عن بوت الشراء — بوت تيليجرام خاص.
 """
 
 import asyncio
@@ -23,26 +17,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"]
-ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 WALLET_ADDRESSES = [
     addr.strip() for addr in os.environ["WALLET_ADDRESSES"].split(",") if addr.strip()
 ]
 
+ALCHEMY_API_KEY_ROBINHOOD = os.environ["ALCHEMY_API_KEY"]
+ALCHEMY_API_KEY_ETHEREUM = os.environ["ALCHEMY_API_KEY_ETHEREUM"]
+
 STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 COLLECTION_STATS_API = "https://api.opensea.io/api/v2/collections"
-ALCHEMY_NFT_API_BASE = f"https://robinhood-mainnet.g.alchemy.com/nft/v3/{ALCHEMY_API_KEY}"
 
-TARGET_CHAIN = "robinhood"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
 HEARTBEAT_INTERVAL = 20
 RECV_TIMEOUT = 5
-HOLDINGS_REFRESH_INTERVAL = 15 * 60      # كل 15 دقيقة
-DIGEST_INTERVAL = 30 * 60                # كل 30 دقيقة
-ACTIVITY_TIMEOUT = 30 * 60               # 30 دقيقة بدون بيع = تخرج من النشاط
+HOLDINGS_REFRESH_INTERVAL = 15 * 60
+DIGEST_INTERVAL = 30 * 60
+ACTIVITY_TIMEOUT = 30 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,21 +45,32 @@ logging.basicConfig(
 )
 log = logging.getLogger("resale-watcher")
 
-# --- حالة النظام ---
-# holdings: slug -> {"count": عدد القطع, "contract": العنوان, "name": الاسم}
+# --- إعدادات كل شبكة ---
+CHAIN_CONFIGS = {
+    "robinhood": {
+        "stream_chain_name": "robinhood",
+        "nft_api_base": f"https://robinhood-mainnet.g.alchemy.com/nft/v3/{ALCHEMY_API_KEY_ROBINHOOD}",
+        "opensea_chain_slug": "robinhood",
+    },
+    "ethereum": {
+        "stream_chain_name": "ethereum",
+        "nft_api_base": f"https://eth-mainnet.g.alchemy.com/nft/v3/{ALCHEMY_API_KEY_ETHEREUM}",
+        "opensea_chain_slug": "ethereum",
+    },
+}
+STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
+
+# holdings: slug -> {"count":, "contract":, "chain_key":}
 holdings: dict[str, dict] = {}
-# active_sales: slug -> آخر وقت بيع مكتشف (timestamp)
 active_sales: dict[str, float] = {}
-
-_floor_price_cache: dict[str, tuple[float, float]] = {}  # slug -> (price, ts)
+_floor_price_cache: dict[str, tuple[float, float]] = {}
 
 
 # ---------------------------------------------------------------------------
-# جلب مقتنياتك من كل المحافظ (Alchemy NFT API)
+# جلب مقتنياتك من كل المحافظ × كل الشبكات
 # ---------------------------------------------------------------------------
 
-def fetch_holdings_for_wallet(wallet: str) -> list[dict]:
-    """يرجع قائمة NFTs بكل صفحاتها لعنوان محفظة واحد."""
+def fetch_holdings_for_wallet(wallet: str, nft_api_base: str) -> list[dict]:
     all_nfts = []
     page_key = None
     try:
@@ -73,7 +78,7 @@ def fetch_holdings_for_wallet(wallet: str) -> list[dict]:
             params = {"owner": wallet, "pageSize": 100, "withMetadata": "false"}
             if page_key:
                 params["pageKey"] = page_key
-            resp = requests.get(f"{ALCHEMY_NFT_API_BASE}/getNFTsForOwner", params=params, timeout=15)
+            resp = requests.get(f"{nft_api_base}/getNFTsForOwner", params=params, timeout=15)
             if resp.status_code != 200:
                 log.warning(f"[Alchemy NFT] HTTP {resp.status_code} لمحفظة {wallet}")
                 break
@@ -87,11 +92,10 @@ def fetch_holdings_for_wallet(wallet: str) -> list[dict]:
     return all_nfts
 
 
-def slug_from_contract(contract_address: str) -> str | None:
-    """يستخرج collection_slug من عنوان العقد عبر OpenSea (نحتاجه للربط مع Stream)."""
+def slug_from_contract(contract_address: str, opensea_chain_slug: str) -> str | None:
     try:
         resp = requests.get(
-            f"https://api.opensea.io/api/v2/chain/{TARGET_CHAIN}/contract/{contract_address}",
+            f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}",
             headers={"x-api-key": OPENSEA_API_KEY},
             timeout=10,
         )
@@ -104,37 +108,38 @@ def slug_from_contract(contract_address: str) -> str | None:
 
 
 async def refresh_holdings():
-    """يحدّث قائمة المقتنيات الكاملة من كل المحافظ."""
-    new_holdings: dict[str, dict] = {}
+    new_by_contract: dict[str, dict] = {}  # (chain_key, contract) -> {"count":, "chain_key":, "contract":}
 
-    for wallet in WALLET_ADDRESSES:
-        nfts = await asyncio.to_thread(fetch_holdings_for_wallet, wallet)
-        for nft in nfts:
-            contract_address = (nft.get("contract") or {}).get("address")
-            if not contract_address:
-                continue
+    for chain_key, cfg in CHAIN_CONFIGS.items():
+        for wallet in WALLET_ADDRESSES:
+            nfts = await asyncio.to_thread(fetch_holdings_for_wallet, wallet, cfg["nft_api_base"])
+            for nft in nfts:
+                contract_address = (nft.get("contract") or {}).get("address")
+                if not contract_address:
+                    continue
+                key = (chain_key, contract_address.lower())
+                if key not in new_by_contract:
+                    new_by_contract[key] = {"count": 0, "contract": contract_address, "chain_key": chain_key}
+                new_by_contract[key]["count"] += 1
 
-            # نتجنب استعلام OpenSea لكل قطعة — نجمع أولاً حسب العقد
-            key = contract_address.lower()
-            if key not in new_holdings:
-                new_holdings[key] = {"count": 0, "contract": contract_address, "slug": None}
-            new_holdings[key]["count"] += 1
-
-    # الآن نحدد الـ slug لكل عقد فريد (استعلام واحد لكل مجموعة، مو لكل قطعة)
     result: dict[str, dict] = {}
-    for key, entry in new_holdings.items():
-        slug = await asyncio.to_thread(slug_from_contract, entry["contract"])
+    for (chain_key, _addr), entry in new_by_contract.items():
+        opensea_chain_slug = CHAIN_CONFIGS[chain_key]["opensea_chain_slug"]
+        slug = await asyncio.to_thread(slug_from_contract, entry["contract"], opensea_chain_slug)
         if not slug:
             continue
         result[slug] = {
             "count": entry["count"],
             "contract": entry["contract"],
-            "slug": slug,
+            "chain_key": chain_key,
         }
 
     holdings.clear()
     holdings.update(result)
-    log.info(f"[مقتنيات] تحديث: {len(holdings)} مجموعة مختلفة، إجمالي القطع: {sum(h['count'] for h in holdings.values())}")
+    per_chain = {}
+    for h in holdings.values():
+        per_chain[h["chain_key"]] = per_chain.get(h["chain_key"], 0) + 1
+    log.info(f"[مقتنيات] تحديث: {len(holdings)} مجموعة — توزيع: {per_chain}")
 
 
 async def holdings_refresh_loop():
@@ -147,13 +152,13 @@ async def holdings_refresh_loop():
 
 
 # ---------------------------------------------------------------------------
-# السعر الأرضي (floor price) — مع كاش بسيط لتفادي استعلامات زايدة
+# السعر الأرضي
 # ---------------------------------------------------------------------------
 
 def fetch_floor_price(slug: str) -> float | None:
     now = time.time()
     cached = _floor_price_cache.get(slug)
-    if cached and (now - cached[1] < 120):  # كاش دقيقتين
+    if cached and (now - cached[1] < 120):
         return cached[0]
     try:
         resp = requests.get(
@@ -213,11 +218,12 @@ def build_digest_message() -> str:
         entry = holdings.get(slug)
         if not entry:
             continue
+        chain_label = "Robinhood Chain" if entry["chain_key"] == "robinhood" else "Ethereum"
         floor = fetch_floor_price(slug)
         floor_line = f"{floor:.4f} ETH" if floor is not None else "غير متاح حاليًا"
         url = f"https://opensea.io/collection/{slug}"
         lines.append(
-            f"\n💎 <b>{slug}</b>\n"
+            f"\n💎 <b>{slug}</b> ({chain_label})\n"
             f"📦 لديك: {entry['count']} قطعة\n"
             f"🏷️ السعر الأرضي الحالي: {floor_line}\n"
             f"🔗 {url}"
@@ -229,8 +235,6 @@ def build_digest_message() -> str:
 async def digest_loop():
     while True:
         await asyncio.sleep(DIGEST_INTERVAL)
-
-        # نظف المجموعات اللي هدأ نشاطها
         now = time.time()
         for slug in list(active_sales.keys()):
             if now - active_sales[slug] > ACTIVITY_TIMEOUT:
@@ -242,7 +246,7 @@ async def digest_loop():
 
 
 # ---------------------------------------------------------------------------
-# الاتصال بـ OpenSea Stream — مراقبة أحداث البيع فقط على مجموعاتك
+# الاتصال بـ OpenSea Stream — يراقب كل الشبكات المفعّلة
 # ---------------------------------------------------------------------------
 
 async def listen_opensea():
@@ -250,7 +254,7 @@ async def listen_opensea():
     while True:
         try:
             async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                log.info("متصل بـ OpenSea Stream — يراقب نشاط بيع مقتنياتك.")
+                log.info(f"متصل بـ OpenSea Stream — يراقب: {list(CHAIN_CONFIGS.keys())}")
                 join_ref = str(msg_ref)
                 await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
                 msg_ref += 1
@@ -283,13 +287,14 @@ async def listen_opensea():
 
                     payload = (payload_wrapper or {}).get("payload") or {}
                     item = payload.get("item", {}) or {}
-                    chain = (item.get("chain", {}) or {}).get("name", "")
-                    if chain != TARGET_CHAIN:
+                    stream_chain_name = (item.get("chain", {}) or {}).get("name", "")
+
+                    if stream_chain_name not in STREAM_NAME_TO_CHAIN_KEY:
                         continue
 
                     slug = (payload.get("collection", {}) or {}).get("slug", "")
                     if not slug or slug not in holdings:
-                        continue  # نراقب فقط مجموعات نملك منها قطع
+                        continue
 
                     was_active = slug in active_sales
                     active_sales[slug] = time.time()
@@ -306,10 +311,10 @@ async def listen_opensea():
 
 async def run():
     enqueue_message(
-        f"✅ نظام مراقبة نشاط البيع اشتغل — يراقب {len(WALLET_ADDRESSES)} محفظة.\n"
-        f"جاري جلب المقتنيات الأولية..."
+        f"✅ نظام مراقبة نشاط البيع اشتغل — يراقب {len(WALLET_ADDRESSES)} محفظة على "
+        f"{', '.join(CHAIN_CONFIGS.keys())}.\nجاري جلب المقتنيات الأولية..."
     )
-    await refresh_holdings()  # تحميل أولي قبل ما نبدأ المراقبة
+    await refresh_holdings()
     await asyncio.gather(
         listen_opensea(),
         holdings_refresh_loop(),
