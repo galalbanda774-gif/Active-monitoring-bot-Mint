@@ -1,9 +1,7 @@
 """
 نظام مراقبة نشاط البيع لمقتنياتك على OpenSea — يدعم Robinhood Chain + Ethereum Mainnet.
 مستقل تمامًا عن بوت الشراء — بوت تيليجرام خاص.
-
-ملاحظة: هذه نسخة فيها تسجيل تشخيصي مؤقت (طباعة أول عنصر خام من Alchemy)
-لتحديد اسم حقل الـ token ID الصحيح بدقة، بدل التخمين.
+السعر يُعرض بالدولار، والرابط يوجه مباشرة لصفحة محفظتك مفلترة على المجموعة.
 """
 
 import asyncio
@@ -66,7 +64,27 @@ holdings: dict[str, dict] = {}
 active_sales: dict[str, float] = {}
 _floor_price_cache: dict[str, tuple[float, float]] = {}
 
-_diagnostic_printed = False  # نطبع أول عنصر خام مرة وحدة بس، أول تشغيل
+_diagnostic_printed = False
+
+_eth_price_cache = {"value": None, "ts": 0}
+
+
+def get_eth_price_usd() -> float:
+    now = time.time()
+    if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < 300):
+        return _eth_price_cache["value"]
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+            timeout=8,
+        )
+        price = resp.json()["ethereum"]["usd"]
+        _eth_price_cache["value"] = price
+        _eth_price_cache["ts"] = now
+        return price
+    except Exception as e:
+        log.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
+        return _eth_price_cache["value"] or 3000.0
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +121,7 @@ def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str)
             timeout=10,
         )
         if resp.status_code == 429:
-            time.sleep(2)  # انتظار إضافي وإعادة محاولة وحدة فقط
+            time.sleep(2)
             resp = requests.get(
                 f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}/nfts/{token_id}",
                 headers={"x-api-key": OPENSEA_API_KEY},
@@ -146,6 +164,7 @@ async def refresh_holdings():
                     new_by_contract[key] = {
                         "count": 0, "contract": contract_address,
                         "chain_key": chain_key, "sample_token_id": token_id,
+                        "owner_wallet": wallet,
                     }
                 new_by_contract[key]["count"] += 1
 
@@ -157,13 +176,14 @@ async def refresh_holdings():
         slug = await asyncio.to_thread(
             slug_from_nft, entry["contract"], entry["sample_token_id"], opensea_chain_slug
         )
-        await asyncio.sleep(0.3)  # تهدئة بسيطة لتفادي حد OpenSea (4 طلبات/ثانية تقريبًا)
+        await asyncio.sleep(0.3)
         if not slug:
             continue
         result[slug] = {
             "count": entry["count"],
             "contract": entry["contract"],
             "chain_key": chain_key,
+            "owner_wallet": entry["owner_wallet"],
         }
 
     holdings.clear()
@@ -241,6 +261,7 @@ async def telegram_sender():
 
 def build_digest_message() -> str:
     now = datetime.now(LOCAL_TZ).strftime("%H:%M")
+    eth_price_usd = get_eth_price_usd()
     lines = [
         "🔥 <b>نشاط بيع على مقتنياتك</b>",
         f"🕐 {now}",
@@ -251,9 +272,13 @@ def build_digest_message() -> str:
         if not entry:
             continue
         chain_label = "Robinhood Chain" if entry["chain_key"] == "robinhood" else "Ethereum"
-        floor = fetch_floor_price(slug)
-        floor_line = f"{floor:.4f} ETH" if floor is not None else "غير متاح حاليًا"
-        url = f"https://opensea.io/collection/{slug}"
+        floor_eth = fetch_floor_price(slug)
+        if floor_eth is not None:
+            floor_usd = floor_eth * eth_price_usd
+            floor_line = f"${floor_usd:,.2f} ({floor_eth:.4f} ETH)"
+        else:
+            floor_line = "غير متاح حاليًا"
+        url = f"https://opensea.io/{entry['owner_wallet']}?collectionSlugs={slug}"
         lines.append(
             f"\n💎 <b>{slug}</b> ({chain_label})\n"
             f"📦 لديك: {entry['count']} قطعة\n"
