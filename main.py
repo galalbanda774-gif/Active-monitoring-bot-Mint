@@ -112,26 +112,32 @@ def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str)
         log.warning(f"[OpenSea NFT] خطأ لعقد {contract_address}: {e}")
         return None
 
-
 async def refresh_holdings():
-    new_by_contract: dict[str, dict] = {}  # (chain_key, contract) -> {"count":, "chain_key":, "contract":}
+    new_by_contract: dict[tuple, dict] = {}  # (chain_key, contract) -> {"count":, "chain_key":, "contract":, "sample_token_id":}
 
     for chain_key, cfg in CHAIN_CONFIGS.items():
         for wallet in WALLET_ADDRESSES:
             nfts = await asyncio.to_thread(fetch_holdings_for_wallet, wallet, cfg["nft_api_base"])
+            log.info(f"[مقتنيات] محفظة {wallet[:10]}... على {chain_key}: {len(nfts)} قطعة.")
             for nft in nfts:
                 contract_address = (nft.get("contract") or {}).get("address")
-                if not contract_address:
+                token_id = nft.get("tokenId")
+                if not contract_address or token_id is None:
                     continue
                 key = (chain_key, contract_address.lower())
                 if key not in new_by_contract:
-                    new_by_contract[key] = {"count": 0, "contract": contract_address, "chain_key": chain_key}
+                    new_by_contract[key] = {
+                        "count": 0, "contract": contract_address,
+                        "chain_key": chain_key, "sample_token_id": token_id,
+                    }
                 new_by_contract[key]["count"] += 1
 
     result: dict[str, dict] = {}
     for (chain_key, _addr), entry in new_by_contract.items():
         opensea_chain_slug = CHAIN_CONFIGS[chain_key]["opensea_chain_slug"]
-        slug = await asyncio.to_thread(slug_from_contract, entry["contract"], opensea_chain_slug)
+        slug = await asyncio.to_thread(
+            slug_from_nft, entry["contract"], entry["sample_token_id"], opensea_chain_slug
+        )
         if not slug:
             continue
         result[slug] = {
