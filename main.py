@@ -92,18 +92,24 @@ def fetch_holdings_for_wallet(wallet: str, nft_api_base: str) -> list[dict]:
     return all_nfts
 
 
-def slug_from_contract(contract_address: str, opensea_chain_slug: str) -> str | None:
+def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str) -> str | None:
+    
     try:
         resp = requests.get(
-            f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}",
+            f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}/nfts/{token_id}",
             headers={"x-api-key": OPENSEA_API_KEY},
             timeout=10,
         )
         if resp.status_code != 200:
+            log.warning(f"[OpenSea NFT] HTTP {resp.status_code} لعقد {contract_address} توكن {token_id}")
             return None
-        return resp.json().get("collection")
+        nft_data = resp.json().get("nft") or {}
+        slug = nft_data.get("collection")
+        if not slug:
+            log.warning(f"[OpenSea NFT] لا يوجد حقل 'collection' بالرد لعقد {contract_address}")
+        return slug
     except Exception as e:
-        log.warning(f"[OpenSea Contract] خطأ لـ {contract_address}: {e}")
+        log.warning(f"[OpenSea NFT] خطأ لعقد {contract_address}: {e}")
         return None
 
 
