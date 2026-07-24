@@ -1,6 +1,9 @@
 """
 نظام مراقبة نشاط البيع لمقتنياتك على OpenSea — يدعم Robinhood Chain + Ethereum Mainnet.
 مستقل تمامًا عن بوت الشراء — بوت تيليجرام خاص.
+
+ملاحظة: هذه نسخة فيها تسجيل تشخيصي مؤقت (طباعة أول عنصر خام من Alchemy)
+لتحديد اسم حقل الـ token ID الصحيح بدقة، بدل التخمين.
 """
 
 import asyncio
@@ -45,7 +48,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("resale-watcher")
 
-# --- إعدادات كل شبكة ---
 CHAIN_CONFIGS = {
     "robinhood": {
         "stream_chain_name": "robinhood",
@@ -60,10 +62,11 @@ CHAIN_CONFIGS = {
 }
 STREAM_NAME_TO_CHAIN_KEY = {cfg["stream_chain_name"]: key for key, cfg in CHAIN_CONFIGS.items()}
 
-# holdings: slug -> {"count":, "contract":, "chain_key":}
 holdings: dict[str, dict] = {}
 active_sales: dict[str, float] = {}
 _floor_price_cache: dict[str, tuple[float, float]] = {}
+
+_diagnostic_printed = False  # نطبع أول عنصر خام مرة وحدة بس، أول تشغيل
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +96,6 @@ def fetch_holdings_for_wallet(wallet: str, nft_api_base: str) -> list[dict]:
 
 
 def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str) -> str | None:
-    
     try:
         resp = requests.get(
             f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}/nfts/{token_id}",
@@ -112,13 +114,21 @@ def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str)
         log.warning(f"[OpenSea NFT] خطأ لعقد {contract_address}: {e}")
         return None
 
+
 async def refresh_holdings():
-    new_by_contract: dict[tuple, dict] = {}  # (chain_key, contract) -> {"count":, "chain_key":, "contract":, "sample_token_id":}
+    global _diagnostic_printed
+
+    new_by_contract: dict[tuple, dict] = {}
 
     for chain_key, cfg in CHAIN_CONFIGS.items():
         for wallet in WALLET_ADDRESSES:
             nfts = await asyncio.to_thread(fetch_holdings_for_wallet, wallet, cfg["nft_api_base"])
             log.info(f"[مقتنيات] محفظة {wallet[:10]}... على {chain_key}: {len(nfts)} قطعة.")
+
+            if nfts and not _diagnostic_printed:
+                log.info(f"[تشخيص] أول عنصر خام: {json.dumps(nfts[0], ensure_ascii=False)[:800]}")
+                _diagnostic_printed = True
+
             for nft in nfts:
                 contract_address = (nft.get("contract") or {}).get("address")
                 token_id = nft.get("tokenId")
@@ -131,6 +141,8 @@ async def refresh_holdings():
                         "chain_key": chain_key, "sample_token_id": token_id,
                     }
                 new_by_contract[key]["count"] += 1
+
+    log.info(f"[تشخيص] عدد العقود الفريدة المجمّعة بعد الفلترة: {len(new_by_contract)}")
 
     result: dict[str, dict] = {}
     for (chain_key, _addr), entry in new_by_contract.items():
@@ -258,7 +270,7 @@ async def digest_loop():
 
 
 # ---------------------------------------------------------------------------
-# الاتصال بـ OpenSea Stream — يراقب كل الشبكات المفعّلة
+# الاتصال بـ OpenSea Stream
 # ---------------------------------------------------------------------------
 
 async def listen_opensea():
