@@ -102,6 +102,13 @@ def slug_from_nft(contract_address: str, token_id: str, opensea_chain_slug: str)
             headers={"x-api-key": OPENSEA_API_KEY},
             timeout=10,
         )
+        if resp.status_code == 429:
+            time.sleep(2)  # انتظار إضافي وإعادة محاولة وحدة فقط
+            resp = requests.get(
+                f"https://api.opensea.io/api/v2/chain/{opensea_chain_slug}/contract/{contract_address}/nfts/{token_id}",
+                headers={"x-api-key": OPENSEA_API_KEY},
+                timeout=10,
+            )
         if resp.status_code != 200:
             log.warning(f"[OpenSea NFT] HTTP {resp.status_code} لعقد {contract_address} توكن {token_id}")
             return None
