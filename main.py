@@ -150,6 +150,7 @@ async def refresh_holdings():
         slug = await asyncio.to_thread(
             slug_from_nft, entry["contract"], entry["sample_token_id"], opensea_chain_slug
         )
+        await asyncio.sleep(0.3)  # تهدئة بسيطة لتفادي حد OpenSea (4 طلبات/ثانية تقريبًا)
         if not slug:
             continue
         result[slug] = {
