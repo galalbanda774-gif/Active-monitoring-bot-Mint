@@ -130,7 +130,7 @@ async def refresh_holdings():
                 _diagnostic_printed = True
 
             for nft in nfts:
-                contract_address = (nft.get("contract") or {}).get("address")
+                contract_address = nft.get("contractAddress")
                 token_id = nft.get("tokenId")
                 if not contract_address or token_id is None:
                     continue
